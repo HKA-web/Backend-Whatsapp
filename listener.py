@@ -1,37 +1,52 @@
 import json
-import threading
+import hashlib
 import logging
 import redis
-import hashlib
+import threading
+import time
 from datetime import datetime, timedelta
+from django.conf import settings
 from whatsapp.tasks import handle_incoming_message
 
-logger = logging.getLogger("wa_listener")
+logger = logging.getLogger('wa_listener')
 
-REDIS_CHANNEL = "whatsapp:inbox"
-REDIS_CONN = redis.Redis(host="localhost", port=6379, db=15)
+# ============================================================
+# REDIS CONFIG
+# ============================================================
+REDIS_SETTINGS = getattr(settings, 'redis', {})
 
-# Cache pesan untuk anti-spam
+REDIS_HOST = REDIS_SETTINGS.get('host', 'localhost')
+REDIS_PORT = REDIS_SETTINGS.get('port', 6379)
+REDIS_DB   = REDIS_SETTINGS.get('db', 15)
+REDIS_PASS = REDIS_SETTINGS.get('password', None)
+REDIS_CHANNEL = REDIS_SETTINGS.get('channel', 'whatsapp:inbox')
+
+# Redis connection (no decode_responses → lebih cepat)
+def redis_conn():
+    return redis.Redis(
+        host=REDIS_HOST,
+        port=REDIS_PORT,
+        db=REDIS_DB,
+        password=REDIS_PASS,
+    )
+
+
+# ============================================================
+# ANTI DUPLICATE CACHE (20 detik)
+# ============================================================
 recent_hashes = {}
-DUPLICATE_TTL = timedelta(seconds=10)
-
-# Flag global untuk memastikan hanya 1 listener berjalan
-_listener_started = False
+DUPLICATE_TTL = timedelta(seconds=20)
 
 
 def is_duplicate_message(data: dict) -> bool:
-    """
-    Cek apakah pesan sudah pernah diterima dalam waktu singkat.
-    """
-    # Buat hash dari isi pesan agar unik berdasarkan konten
-    raw = json.dumps(data, sort_keys=True)
-    msg_hash = hashlib.md5(raw.encode()).hexdigest()
+    raw = json.dumps(data, sort_keys=True, separators=(',', ':'))
+    msg_hash = hashlib.sha256(raw.encode()).hexdigest()
     now = datetime.now()
 
-    # Bersihkan cache lama
-    for h, ts in list(recent_hashes.items()):
-        if now - ts > DUPLICATE_TTL:
-            del recent_hashes[h]
+    # Cleanup hash lama
+    expired = [h for h, ts in recent_hashes.items() if now - ts > DUPLICATE_TTL]
+    for h in expired:
+        del recent_hashes[h]
 
     if msg_hash in recent_hashes:
         return True
@@ -40,50 +55,69 @@ def is_duplicate_message(data: dict) -> bool:
     return False
 
 
+# ============================================================
+# REDIS SUBSCRIBER
+# ============================================================
 def redis_subscriber():
-    """
-    Dengarkan channel Redis dan panggil handle_incoming_message setiap pesan baru.
-    """
-    pubsub = REDIS_CONN.pubsub(ignore_subscribe_messages=True)
-    pubsub.subscribe(REDIS_CHANNEL)
-
-    logger.info(f"📡 Listening Redis channel: {REDIS_CHANNEL}")
-
-    for message in pubsub.listen():
+    '''
+    Listener yang stabil:
+    - Auto reconnect kalau Redis putus
+    - Tidak exit bila ada error satu pesan
+    '''
+    while True:
         try:
-            if message.get("type") != "message":
-                continue
+            r = redis_conn()
+            pubsub = r.pubsub(ignore_subscribe_messages=True)
+            pubsub.subscribe(REDIS_CHANNEL)
 
-            # Parse data
-            raw_data = message["data"]
-            if isinstance(raw_data, bytes):
-                raw_data = raw_data.decode("utf-8")
+            logger.info(f'📡 Redis subscriber listening on channel: {REDIS_CHANNEL}')
 
-            data = json.loads(raw_data)
+            for message in pubsub.listen():
+                if message.get('type') != 'message':
+                    continue
 
-            # ✅ Hindari duplikasi pesan yang identik
-            if is_duplicate_message(data):
-                logger.debug("⏩ Duplikat pesan, diabaikan.")
-                continue
+                try:
+                    raw = message['data']
+                    if isinstance(raw, bytes):
+                        raw = raw.decode('utf-8')
 
-            logger.info(f"📨 Pesan baru diterima di channel {REDIS_CHANNEL}")
-            handle_incoming_message(data)
+                    data = json.loads(raw)
+
+                    # Anti duplikat
+                    if is_duplicate_message(data):
+                        logger.debug('⏩ Duplikat pesan diabaikan')
+                        continue
+
+                    logger.info('📨 Pesan baru diterima, dikirim ke worker Huey')
+                    handle_incoming_message(data)
+
+                except Exception as e:
+                    logger.exception(f'⚠️ Error memproses pesan: {e}')
+
+        except redis.exceptions.ConnectionError:
+            logger.warning('❌ Redis connection lost → retry 2 detik...')
+            time.sleep(2)
 
         except Exception as e:
-            logger.exception(f"⚠️ Error memproses pesan Redis: {e}")
+            logger.exception(f'Fatal subscriber error: {e}')
+            time.sleep(2)
+
+
+# ============================================================
+# START LISTENER (TIDAK BOLEH DOUBLE)
+# ============================================================
+_listener_started = False
 
 
 def start_listener():
-    """
-    Jalankan listener di thread terpisah agar tidak blokir proses utama.
-    Hindari multiple start akibat Django reload (runserver).
-    """
     global _listener_started
     if _listener_started:
-        logger.info("⚙️ Redis listener sudah aktif, skip start ulang.")
+        logger.debug('Redis listener already running → skip')
         return
 
     _listener_started = True
-    listener_thread = threading.Thread(target=redis_subscriber, daemon=True)
-    listener_thread.start()
-    logger.info("🚀 Redis listener thread started")
+
+    t = threading.Thread(target=redis_subscriber, daemon=True)
+    t.start()
+
+    logger.info('🚀 Redis listener thread started')

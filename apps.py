@@ -13,7 +13,6 @@ class WhatsappConfig(AppConfig):
         Dipanggil otomatis saat Django startup.
         Hanya jalan sekali (hindari duplikasi akibat autoreload).
         """
-        # Hanya jalankan di proses utama (bukan reloader)
         if os.environ.get("RUN_MAIN") != "true":
             return
 
