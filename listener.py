@@ -13,13 +13,13 @@ logger = logging.getLogger('wa_listener')
 # ============================================================
 # REDIS CONFIG
 # ============================================================
-REDIS_SETTINGS = getattr(settings, 'redis', {})
+REDIS_CONF = getattr(settings, 'REDIS_CONF', {})
 
-REDIS_HOST = REDIS_SETTINGS.get('host', 'localhost')
-REDIS_PORT = REDIS_SETTINGS.get('port', 6379)
-REDIS_DB   = REDIS_SETTINGS.get('db', 15)
-REDIS_PASS = REDIS_SETTINGS.get('password', None)
-REDIS_CHANNEL = REDIS_SETTINGS.get('channel', 'whatsapp:inbox')
+REDIS_HOST = REDIS_CONF.get('host', 'localhost')
+REDIS_PORT = REDIS_CONF.get('port', 6379)
+REDIS_DB   = REDIS_CONF.get('db', 15)
+REDIS_PASS = REDIS_CONF.get('password', None)
+REDIS_CHANNEL = REDIS_CONF.get('channel', 'whatsapp:inbox')
 
 # Redis connection (no decode_responses → lebih cepat)
 def redis_conn():

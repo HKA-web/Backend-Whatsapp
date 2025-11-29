@@ -12,6 +12,10 @@ from django.utils import timezone
 import requests
 import re as regex
 from django.utils.translation import gettext_lazy as _
+from utils.sslinogre import *
+from pathlib import Path
+import yaml
+from whatsapp.utils import *
 
 logger = logging.getLogger('wa_tasks')
 
@@ -26,156 +30,176 @@ def queue_send_reply(sender, message, device_id, outbox_id=None):
     Retry max 3x via Outbox.retry.
     Anti-spam & aman dari error DB/parsing.
     """
-    # Default metadata
-    prepare_date   = timezone.now()
-    session_id     = device_id
-    properties     = {}
-    retry          = 0
-    scheduled      = False
-    scheduled_date = None
-    is_interactive = False
-    is_answered    = False
-    answered_date  = None
-    data           = {}
+    if settings.STANDALONE is False:
+        # Mode langsung POST ke Node.js
+        payload = {
+            "jid": sender,
+            "message": message,
+            "_botDevice": device_id,
+        }
 
-    # ======================================================
-    # LOAD OUTBOX (JIKA ADA)
-    # ======================================================
-    outbox = None
-    if outbox_id is not None:
+        url = settings.NODE_API_URL
+        if device_id:
+            url = f"{url}?device={device_id}"
+
         try:
-            outbox = Outbox.objects.using('erpro').get(pk=outbox_id)
-            prepare_date   = outbox.created
-            session_id     = outbox.session_id
-            properties     = outbox.properties or {}
-            retry          = outbox.retry or 0
-            scheduled      = outbox.scheduled or False
-            scheduled_date = outbox.scheduled_date
-            is_interactive = outbox.is_interactive
-            is_answered    = outbox.is_answered
-            answered_date  = outbox.answered_date
-            data           = outbox.data or {}
+            res = requests.post(url, json=payload, timeout=20)
         except Exception as e:
-            logger.error(f"⚠ Tidak bisa load Outbox {outbox_id}: {e}")
-
-    payload = {
-        "jid": sender,
-        "message": message,
-        "_botDevice": device_id,
-    }
-
-    url = settings.NODE_API_URL
-    if device_id:
-        url = f"{url}?device={device_id}"
-
-    # ======================================================
-    # STAGE 1 — POST KE NODE.JS → jika gagal: update retry
-    # ======================================================
-    try:
-        res = requests.post(url, json=payload, timeout=20)
-    except Exception as e:
-        logger.error(f"❌ POST ke Node.js gagal: {e}")
-        if outbox:
-            outbox.data = outbox.data or {}
-            outbox.data["traceback"] = str(e)
-            outbox.modified = timezone.now()
-            outbox.retry = (outbox.retry or 0) + 1
-            outbox.save(update_fields=["data", "retry", "modified"])
-        return
-
-    if res.status_code != 200:
-        logger.warning(f"⚠ Node.js status {res.status_code}: {res.text}")
-        if outbox:
-            outbox.data = outbox.data or {}
-            outbox.data["traceback"] = res.text
-            outbox.modified = timezone.now()
-            outbox.retry = (outbox.retry or 0) + 1
-            outbox.save(update_fields=["data", "retry", "modified"])
-        return
-
-    # ======================================================
-    # STAGE 2 — Node.js SUKSES
-    # ======================================================
-    try:
-        response = res.json()
-        results = response.get("results", [])
-
-        _sent_date     = timezone.now()
-        _answered_date = answered_date or timezone.now()
-        _props         = properties or {}
-        _data          = data or {}
-
-        internal_errors = []
-
-        for r in results:
-            status = r.get("status")
-            if status == "error":
-                internal_errors.append(r.get("error") or "Unknown error")
-                continue
-
-            message_id = r.get("message_id")
-            if not message_id:
-                internal_errors.append("Node.js tidak mengirim message_id")
-                continue
-
-            # Aman: get_or_create → anti spam
-            Sent.objects.using("erpro").get_or_create(
-                sent_id=message_id,
-                defaults={
-                    "sent_id": message_id,
-                    "message": message,
-                    "message_type": "conversation",
-                    "sent_for": sender,
-                    "sent_date": _sent_date,
-                    "prepare_date": prepare_date,
-                    "retry": retry,
-                    "scheduled": scheduled,
-                    "scheduled_date": scheduled_date,
-                    "is_interactive": is_interactive,
-                    "is_answered": is_answered,
-                    "answered_date": _answered_date,
-                    "data": _data,
-                    "session_id": session_id,
-                    "created": timezone.now(),
-                    "modified": timezone.now(),
-                    "is_removed": False,
-                    "read_only": False,
-                    "enable": True,
-                    "properties": _props,
-                    "description": None,
-                    "status": "sent",
-                }
-            )
-
-        # Jika ada error internal → update retry Outbox
-        if internal_errors and outbox:
-            outbox.data = outbox.data or {}
-            outbox.data["traceback"] = internal_errors
-            outbox.modified = timezone.now()
-            outbox.retry = (outbox.retry or 0) + 1
-            outbox.save(update_fields=["data", "retry", "modified"])
-            logger.error(f"⚠ Error internal Node.js: {internal_errors}")
+            logger.error(f"❌ POST ke Node.js gagal: {e}")
             return
 
-        # Semua sukses → hapus outbox
-        if outbox:
+    else:
+        # Mode simpan ke Outbox lokal
+        # Default metadata
+        prepare_date = timezone.now()
+        session_id = device_id
+        properties = {}
+        retry = 0
+        scheduled = False
+        scheduled_date = None
+        is_interactive = False
+        is_answered = False
+        answered_date = None
+        data = {}
+
+        # ======================================================
+        # LOAD OUTBOX (JIKA ADA)
+        # ======================================================
+        outbox = None
+        if outbox_id:
             try:
-                outbox.delete(using='erpro')
-                logger.info(f"🗑 Outbox {outbox.outbox_id} dihapus (success).")
+                outbox = Outbox.objects.using('erpro').get(pk=outbox_id)
+                prepare_date = outbox.created
+                session_id = outbox.session_id
+                properties = outbox.properties or {}
+                retry = outbox.retry or 0
+                scheduled = outbox.scheduled or False
+                scheduled_date = outbox.scheduled_date
+                is_interactive = outbox.is_interactive
+                is_answered = outbox.is_answered
+                answered_date = outbox.answered_date
+                data = outbox.data or {}
             except Exception as e:
-                logger.error(f"⚠ Gagal menghapus Outbox {outbox.outbox_id}: {e}")
+                logger.error(f"⚠ Tidak bisa load Outbox {outbox_id}: {e}")
 
-        logger.info(f"✔ WA terkirim → {sender} (device={device_id or 'default'})")
+        payload = {
+            "jid": sender,
+            "message": message,
+            "_botDevice": device_id,
+        }
 
-    except Exception as e:
-        logger.error(f"⚠ WA terkirim tapi gagal simpan DB/parsing: {e}")
-        if outbox:
-            outbox.data = outbox.data or {}
-            outbox.data["traceback"] = str(e)
-            outbox.modified = timezone.now()
-            outbox.retry = (outbox.retry or 0) + 1
-            outbox.save(update_fields=["data", "retry", "modified"])
-        return
+        url = settings.NODE_API_URL
+        if device_id:
+            url = f"{url}?device={device_id}"
+
+        # ======================================================
+        # STAGE 1 — POST KE NODE.JS → jika gagal: update retry
+        # ======================================================
+        try:
+            res = requests.post(url, json=payload, timeout=20)
+        except Exception as e:
+            logger.error(f"❌ POST ke Node.js gagal: {e}")
+            if outbox:
+                outbox.data = outbox.data or {}
+                outbox.data["traceback"] = str(e)
+                outbox.modified = timezone.now()
+                outbox.retry = retry + 1
+                outbox.save(update_fields=["data", "retry", "modified"])
+            return
+
+        if res.status_code != 200:
+            logger.warning(f"⚠ Node.js status {res.status_code}: {res.text}")
+            if outbox:
+                outbox.data = outbox.data or {}
+                outbox.data["traceback"] = res.text
+                outbox.modified = timezone.now()
+                outbox.retry = retry + 1
+                outbox.save(update_fields=["data", "retry", "modified"])
+            return
+
+        # ======================================================
+        # STAGE 2 — Node.js SUKSES
+        # ======================================================
+        try:
+            response = res.json()
+            results = response.get("results", [])
+
+            _sent_date = timezone.now()
+            _answered_date = answered_date or timezone.now()
+            _props = properties or {}
+            _data = data or {}
+
+            internal_errors = []
+
+            for r in results:
+                status = r.get("status")
+                if status == "error":
+                    internal_errors.append(r.get("error") or "Unknown error")
+                    continue
+
+                message_id = r.get("message_id")
+                if not message_id:
+                    internal_errors.append("Node.js tidak mengirim message_id")
+                    continue
+
+                # Aman: get_or_create → anti spam
+                Sent.objects.using("erpro").get_or_create(
+                    sent_id=message_id,
+                    defaults={
+                        "sent_id": message_id,
+                        "message": message,
+                        "message_type": "conversation",
+                        "sent_for": sender,
+                        "sent_date": _sent_date,
+                        "prepare_date": prepare_date,
+                        "retry": retry,
+                        "scheduled": scheduled,
+                        "scheduled_date": scheduled_date,
+                        "is_interactive": is_interactive,
+                        "is_answered": is_answered,
+                        "answered_date": _answered_date,
+                        "data": _data,
+                        "session_id": session_id,
+                        "created": timezone.now(),
+                        "modified": timezone.now(),
+                        "is_removed": False,
+                        "read_only": False,
+                        "enable": True,
+                        "properties": _props,
+                        "description": None,
+                        "status": "sent",
+                    }
+                )
+
+            # Jika ada error internal → update retry Outbox
+            if internal_errors and outbox:
+                outbox.data = outbox.data or {}
+                outbox.data["traceback"] = internal_errors
+                outbox.modified = timezone.now()
+                outbox.retry = retry + 1
+                outbox.save(update_fields=["data", "retry", "modified"])
+                logger.error(f"⚠ Error internal Node.js: {internal_errors}")
+                return
+
+            # Semua sukses → hapus outbox
+            if outbox:
+                try:
+                    outbox.delete(using='erpro')
+                    logger.info(f"🗑 Outbox {outbox.outbox_id} dihapus (success).")
+                except Exception as e:
+                    logger.error(f"⚠ Gagal menghapus Outbox {outbox.outbox_id}: {e}")
+
+            logger.info(f"✔ WA terkirim → {sender} (device={device_id or 'default'})")
+
+        except Exception as e:
+            logger.error(f"⚠ WA terkirim tapi gagal simpan DB/parsing: {e}")
+            if outbox:
+                outbox.data = outbox.data or {}
+                outbox.data["traceback"] = str(e)
+                outbox.modified = timezone.now()
+                outbox.retry = retry + 1
+                outbox.save(update_fields=["data", "retry", "modified"])
+            return
 
 
 # ======================================================
@@ -205,7 +229,7 @@ def handle_incoming_message(data):
 # FALLBACK AI
 # ======================================================
 @task(retries=2, retry_delay=3)
-def async_fallback_reply(sender, data, device_id):
+def ai_reply(sender, data, device_id):
     text = data.get('text', '').strip()
 
     FALLBACK_URL = settings.AI_AGENT_URL
@@ -230,16 +254,71 @@ def async_fallback_reply(sender, data, device_id):
 
 
 # ======================================================
+# FALLBACK
+# ======================================================
+@task(retries=2, retry_delay=3)
+def async_fallback_reply(sender, data, device_id):
+    try:
+        # ambil token access terbaru dari config.yaml
+        token = LoadWebhookAuth()
+
+        body = [{
+            "message": "Hai hakim",
+            "message_type": "conversation",
+            "outbox_for": "6285648007953@s.whatsapp.net",
+            "is_interactive": False,
+            "session": f"{device_id}",
+            "properties": {"id": "-"},
+            "description": ""
+        }]
+
+        # 1) Send normal
+        res = SendMessage(token, body)
+
+        if res.get("success"):
+            return True
+
+        # 2) Refresh token
+        if Refresh():
+            new_token = LoadWebhookAuth()
+            res2 = SendMessage(new_token, body)
+
+            if res2.get("success"):
+                return True
+
+        # 3) Auth ulang
+        if Auth():
+            fresh_token = LoadWebhookAuth()
+            res3 = SendMessage(fresh_token, body)
+
+            if res3.get("success"):
+                return True
+
+        # 4) Semua gagal
+        queue_send_reply(sender, "❌ Gagal mengirim pesan ke server", device_id)
+        return False
+
+    except Exception as e:
+        queue_send_reply(sender, f"❌ Error sistem: {e}", device_id)
+        return False
+
+
+# ======================================================
 # PERIODIC TASK: PROCESS OUTBOX
 # ======================================================
 @periodic_task(crontab(minute='*'))
 def outbox_process():
-    outboxs = Outbox.objects.using('erpro').filter(
+    # Jika bukan mode STANDALONE → langsung keluar, jangan collect Outbox
+    # if not settings.STANDALONE:
+        # return
+
+    # Mode standalone → baru collect Outbox
+    outbox_list = Outbox.objects.using('erpro').filter(
         message_type='conversation',
-        retry__lt=settings.RETRY  # hanya yang belum melebihi limit retry
+        retry__lt=settings.RETRY
     )
 
-    for outbox in outboxs:
+    for outbox in outbox_list:
         try:
             queue_send_reply(
                 outbox.outbox_for,

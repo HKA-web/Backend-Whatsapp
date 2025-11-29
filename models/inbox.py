@@ -2,7 +2,7 @@ from django.db import models
 from django.apps import apps
 from django.utils.translation import gettext_lazy as _
 from whatsapp.models.session import Session
-from whatsapp.utils import strings
+from utils.strings import stringproperties
 
 app_config = apps.get_containing_app_config(__name__)
 
@@ -70,7 +70,7 @@ class Inbox(models.Model):
     def parameter(self):
         parameter = {}
         if self.command:
-            parameter = strings.stringproperties(self.message)
+            parameter = stringproperties(self.message)
         return parameter
 
     class Meta:
